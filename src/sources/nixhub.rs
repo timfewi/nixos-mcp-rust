@@ -10,11 +10,12 @@ use serde_json::Value;
 use crate::App;
 use crate::config::{CACHE_NIXOS_ORG, NIXHUB_API};
 use crate::http::{FetchError, Response};
-use crate::text::{display, ellipsize, err, error, first_chars, format_size, parse_iso, str_of, strings, truthy};
+use crate::text::{display, ellipsize, err, error, format_size, parse_iso, str_of, strings, truthy};
 
 /// Parsed narinfo key fields.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NarInfo {
+    pub store_path: Option<String>,
     pub file_size: Option<u64>,
     pub nar_size: Option<u64>,
     pub compression: Option<String>,
@@ -28,6 +29,7 @@ pub fn parse_narinfo(text: &str) -> NarInfo {
         };
         let value = value.trim();
         match key.trim().to_lowercase().as_str() {
+            "storepath" => result.store_path = Some(value.to_owned()),
             "filesize" => result.file_size = value.parse().ok().or(result.file_size),
             "narsize" => result.nar_size = value.parse().ok().or(result.nar_size),
             "compression" => result.compression = Some(value.to_owned()),
@@ -65,10 +67,14 @@ pub async fn fetch_pkg(app: &App, name: &str) -> Result<Value, String> {
 }
 
 /// The output marked default, or the first one.
-fn default_output_path(system: &Value) -> &str {
+fn default_output(system: &Value) -> Option<&Value> {
     let outputs = system.get("outputs").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let default = outputs.iter().find(|output| output.get("default").is_some_and(truthy));
-    default.or(outputs.first()).map_or("", |output| str_of(output, "path"))
+    default.or(outputs.first())
+}
+
+fn default_output_path(system: &Value) -> &str {
+    default_output(system).map_or("", |output| str_of(output, "path"))
 }
 
 fn store_hash(store_path: &str) -> &str {
@@ -76,25 +82,35 @@ fn store_hash(store_path: &str) -> &str {
 }
 
 /// Check binary cache status for a single system.
-async fn check_system_cache(app: &App, system: String, store_path: String) -> Vec<String> {
+async fn check_system_cache(app: &App, system: &str, info: &Value) -> Vec<String> {
     let mut results = vec![format!("System: {system}")];
+    if let Some(reference) = flake_reference(info) {
+        results.push(format!("  Flake reference: {reference}"));
+    }
+    let output = default_output(info);
+    let store_path = default_output_path(info);
+    if let Some(name) = output.and_then(|o| o.get("name")).and_then(Value::as_str) {
+        results.push(format!("  Output: {name}"));
+    }
     if store_path.is_empty() {
         results.extend(["  Store path: Not available".to_owned(), "  Status: UNKNOWN".to_owned(), String::new()]);
         return results;
     }
     results.push(format!("  Store path: {store_path}"));
     // The hash is the 32-character base32 string after /nix/store/.
-    let hash = store_hash(&store_path);
+    let hash = store_hash(store_path);
     if hash.chars().count() != 32 {
         results.extend(["  Status: UNKNOWN (invalid store path)".to_owned(), String::new()]);
         return results;
     }
 
     let url = format!("{CACHE_NIXOS_ORG}/{hash}.narinfo");
-    match app.http.send(app.http.head(&url), 5).await.map(|head| head.status()) {
-        Ok(200) => match app.http.send(app.http.get(&url), 5).await {
-            Ok(resp) if resp.status() == 200 => {
-                let narinfo = parse_narinfo(&resp.text());
+    match app.http.send(app.http.get(&url), 5).await {
+        Ok(resp) if resp.status() == 200 => {
+            let narinfo = parse_narinfo(&resp.text());
+            if narinfo.store_path.as_deref() != Some(store_path) {
+                results.push("  Status: UNKNOWN (narinfo store path mismatch)".to_owned());
+            } else {
                 results.push("  Status: CACHED".to_owned());
                 if let Some(size) = narinfo.file_size {
                     results.push(format!("  Download size: {}", format_size(size)));
@@ -106,11 +122,9 @@ async fn check_system_cache(app: &App, system: String, store_path: String) -> Ve
                     results.push(format!("  Compression: {compression}"));
                 }
             }
-            Ok(_) => results.push("  Status: CACHED".to_owned()),
-            Err(_) => results.push("  Status: UNKNOWN (cache check failed)".to_owned()),
-        },
-        Ok(404) => results.push("  Status: NOT CACHED".to_owned()),
-        Ok(status) => results.push(format!("  Status: UNKNOWN (HTTP {status})")),
+        }
+        Ok(resp) if resp.status() == 404 => results.push("  Status: NOT CACHED".to_owned()),
+        Ok(resp) => results.push(format!("  Status: UNKNOWN (HTTP {})", resp.status())),
         Err(_) => results.push("  Status: UNKNOWN (cache check failed)".to_owned()),
     }
     results.push(String::new());
@@ -133,16 +147,12 @@ pub async fn check_binary_cache(app: &App, name: &str, version: &str, system: &s
         Some(_) => return error("Invalid systems data from NixHub", "API_ERROR"),
     };
 
-    let mut systems: Vec<(String, String)> = systems_data
-        .iter()
-        .filter(|(_, info)| info.is_object())
-        .map(|(sys_name, info)| (sys_name.clone(), default_output_path(info).to_owned()))
-        .collect();
+    let mut systems: Vec<_> = systems_data.iter().filter(|(_, info)| info.is_object()).collect();
     if systems.is_empty() {
         return error(format!("No systems found for {name}@{pkg_version}"), "NOT_FOUND");
     }
     if !system.is_empty() {
-        systems.retain(|(sys_name, _)| sys_name == system);
+        systems.retain(|(sys_name, _)| sys_name.as_str() == system);
         if systems.is_empty() {
             let mut available: Vec<&str> = systems_data.keys().map(String::as_str).collect();
             available.sort_unstable();
@@ -150,7 +160,11 @@ pub async fn check_binary_cache(app: &App, name: &str, version: &str, system: &s
         }
     }
 
-    let mut results = vec![format!("Binary Cache Status: {pkg_name}@{pkg_version}"), String::new()];
+    let mut results = vec![
+        format!("Binary Cache Status: {pkg_name}@{pkg_version}"),
+        format!("Cache: {CACHE_NIXOS_ORG} (NixHub resolution)"),
+        String::new(),
+    ];
     let checks = systems.into_iter().map(|(sys_name, path)| check_system_cache(app, sys_name, path));
     results.extend(join_all(checks).await.into_iter().flatten());
     crate::text::strip(&results.join("\n")).to_owned()
@@ -207,7 +221,7 @@ pub fn program_summary(programs: &[String]) -> String {
     if programs.len() > 10 { format!("{shown} ... ({} total)", programs.len()) } else { shown }
 }
 
-/// Flake reference of a resolved system: `github:owner/repo/rev8#attr`.
+/// Flake reference of a resolved system: `github:owner/repo/revision#attr`.
 fn flake_reference(system: &Value) -> Option<String> {
     let installable = system.get("flake_installable").filter(|value| truthy(value))?;
     let reference = installable.get("ref")?;
@@ -218,8 +232,12 @@ fn flake_reference(system: &Value) -> Option<String> {
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    let rev = first_chars(str_of(reference, "rev"), 8);
-    Some(format!("github:{owner}/{repo}/{rev}#{}", str_of(installable, "attr_path")))
+    let rev = str_of(reference, "rev");
+    let attr = str_of(installable, "attr_path");
+    if rev.len() != 40 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) || attr.is_empty() {
+        return None;
+    }
+    Some(format!("github:{owner}/{repo}/{rev}#{attr}"))
 }
 
 /// Get detailed package info, combining v1/pkg (rich metadata) with v2/resolve
@@ -343,7 +361,15 @@ mod tests {
     #[test]
     fn narinfo_skips_malformed_values() {
         let parsed = parse_narinfo("StorePath: /nix/store/x\nFileSize: 10\nNarSize: nope\nCompression: zstd\njunk\n");
-        assert_eq!(parsed, NarInfo { file_size: Some(10), nar_size: None, compression: Some("zstd".to_owned()) });
+        assert_eq!(
+            parsed,
+            NarInfo {
+                store_path: Some("/nix/store/x".into()),
+                file_size: Some(10),
+                nar_size: None,
+                compression: Some("zstd".to_owned())
+            }
+        );
     }
 
     #[test]

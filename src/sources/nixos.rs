@@ -1,16 +1,17 @@
 //! NixOS packages and options source.
 
 use std::collections::BTreeSet;
+use std::path::{Component, Path};
 use std::sync::LazyLock;
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::base::{channel_suggestions, es_query};
+use super::base::{EsError, embedded_commit, es_count, es_query_with_status as es_query, with_nixos_index};
 use super::flakes::search_flakes;
 use crate::App;
-use crate::config::NIXOS_API;
-use crate::text::{commas, display, err, error, first_chars, str_of, strings, strip, truthy, words};
+use crate::text::{commas, display, error, first_chars, str_of, strings, strip, truthy, words};
 
 // Field weights mirror the search.nixos.org frontend Elm source (nixos-search:
 // frontend/src/Search/Query.elm). Each `field^w` is followed by `field.*^(w*0.6)`
@@ -159,16 +160,10 @@ pub async fn search_nixos(app: &App, query: &str, search_type: &str, limit: i64,
     if search_type == "flakes" {
         return search_flakes(app, query, limit).await;
     }
-    let channels = app.caches.channels.resolved(&app.http).await;
-    let Some(index) = channels.get(channel) else {
-        return err(format!("Invalid channel '{channel}'. {}", channel_suggestions(&channels, channel).await));
-    };
-
     let query = first_chars(strip(query), MAX_QUERY_LEN);
-    let none_found = || format!("No {search_type} found matching '{query}'");
     if query_words(query).is_empty() {
         // An empty multi_match would just be a slow way to match nothing.
-        return none_found();
+        return format!("No {search_type} found matching '{query}'");
     }
 
     let (es, rescore) = match search_type {
@@ -202,19 +197,22 @@ pub async fn search_nixos(app: &App, query: &str, search_type: &str, limit: i64,
             Some(package_rescore()),
         ),
     };
-    let hits = match es_query(app, index, es, limit, rescore).await {
-        Ok(hits) => hits,
-        Err(failure) => return err(failure),
-    };
-    if hits.is_empty() {
-        return none_found();
-    }
+    with_nixos_index(app, channel, |index| {
+        let (es, rescore) = (es.clone(), rescore.clone());
+        async move {
+            let hits = es_query(app, &index, es, limit, rescore).await?;
+            Ok(render_search(&hits, query, search_type))
+        }
+    })
+    .await
+}
 
+fn render_search(hits: &[Value], query: &str, search_type: &str) -> String {
     // Count what is actually rendered: programs drops hits without an exact
     // program match, so `hits.len()` would overstate the result count.
     let mut shown = 0;
     let mut results = Vec::new();
-    for hit in &hits {
+    for hit in hits {
         let src = source_of(hit);
         match search_type {
             "packages" => {
@@ -256,7 +254,7 @@ pub async fn search_nixos(app: &App, query: &str, search_type: &str, limit: i64,
         }
     }
     if shown == 0 {
-        return none_found();
+        return format!("No {search_type} found matching '{query}'");
     }
     let mut lines = vec![format!("Found {shown} {search_type} matching '{query}':\n")];
     lines.append(&mut results);
@@ -273,6 +271,38 @@ fn pname_of(hit: &Value) -> &str {
 
 fn term_query(kind: &str, field: &str, name: &str) -> Value {
     json!({"bool": {"must": [{"term": {"type": kind}}, {"term": {field: name}}]}})
+}
+
+const SOURCE_PATH_ESCAPES: &AsciiSet = &CONTROLS.add(b' ').add(b'%').add(b'#').add(b'?').add(b'\\');
+
+fn definition_link(position: &str, revision: &str) -> Option<String> {
+    let (path, line) = position
+        .rsplit_once(':')
+        .filter(|(_, line)| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or((position, ""));
+    if path.is_empty()
+        || path.contains(':')
+        || !Path::new(path).components().all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    let path = utf8_percent_encode(path, SOURCE_PATH_ESCAPES);
+    let mut url = format!("https://github.com/NixOS/nixpkgs/blob/{revision}/{path}");
+    if !line.is_empty() {
+        url.push_str(&format!("#L{line}"));
+    }
+    Some(url)
+}
+
+async fn definition(app: &App, index: &str, hit: &Value, position: &str) -> Option<String> {
+    if position.is_empty() {
+        return None;
+    }
+    let hit_index = str_of(hit, "_index");
+    let alias_target = if hit_index.is_empty() { app.caches.channels.indexed_target(index).await } else { None };
+    let revision = embedded_commit(alias_target.as_deref().unwrap_or(hit_index));
+    let value = revision.and_then(|revision| definition_link(position, revision));
+    Some(format!("Declared in: {}", value.as_deref().unwrap_or(position)))
 }
 
 /// Note attached when several packages share the requested pname, naming the
@@ -292,7 +322,7 @@ fn ambiguity_note(name: &str, chosen_attr: &str, candidates: &[Value], channel: 
     ))
 }
 
-async fn info_package(app: &App, index: &str, name: &str, channel: &str) -> Result<String, String> {
+async fn info_package(app: &App, index: &str, name: &str, channel: &str) -> Result<String, EsError> {
     // Priority 1: exact attribute path. One attr maps to one package, which also
     // disambiguates packages sharing a pname (firefox, firefox-esr, ...).
     let mut hits = es_query(app, index, term_query("package", "package_attr_name", name), 1, None).await?;
@@ -314,7 +344,7 @@ async fn info_package(app: &App, index: &str, name: &str, channel: &str) -> Resu
     let attr_name = str_of(src, "package_attr_name");
     let pname = str_of(src, "package_pname");
     let mut info = vec![format!("Package: {pname}")];
-    if !attr_name.is_empty() && attr_name != pname {
+    if !attr_name.is_empty() {
         info.push(format!("Attribute: {attr_name}"));
     }
     info.push(format!("Version: {}", str_of(src, "package_pversion")));
@@ -330,6 +360,23 @@ async fn info_package(app: &App, index: &str, name: &str, channel: &str) -> Resu
     if !licenses.is_empty() {
         info.push(format!("License: {}", licenses.join(", ")));
     }
+    for (label, key) in [("Main program", "package_mainProgram"), ("Default output", "package_default_output")] {
+        let value = str_of(src, key);
+        if !value.is_empty() {
+            info.push(format!("{label}: {value}"));
+        }
+    }
+    for (label, key) in
+        [("Programs", "package_programs"), ("Outputs", "package_outputs"), ("Platforms", "package_platforms")]
+    {
+        let values = strings(src.get(key));
+        if !values.is_empty() {
+            info.push(format!("{label}: {}", values.join(", ")));
+        }
+    }
+    if let Some(line) = definition(app, index, hit, str_of(src, "package_position")).await {
+        info.push(line);
+    }
     if candidates.len() > 1 {
         let chosen_attr = if attr_name.is_empty() { pname } else { attr_name };
         if let Some(note) = ambiguity_note(name, chosen_attr, &candidates, channel) {
@@ -340,7 +387,7 @@ async fn info_package(app: &App, index: &str, name: &str, channel: &str) -> Resu
     Ok(info.join("\n"))
 }
 
-async fn info_option(app: &App, index: &str, name: &str) -> Result<String, String> {
+async fn info_option(app: &App, index: &str, name: &str) -> Result<String, EsError> {
     let hits = es_query(app, index, term_query("option", "option_name", name), 1, None).await?;
     let Some(hit) = hits.first() else {
         return Ok(error(format!("Option '{name}' not found"), "NOT_FOUND"));
@@ -361,42 +408,36 @@ async fn info_option(app: &App, index: &str, name: &str) -> Result<String, Strin
             info.push(format!("{label}: {value}"));
         }
     }
+    if let Some(line) = definition(app, index, hit, str_of(src, "option_source")).await {
+        info.push(line);
+    }
     Ok(info.join("\n"))
 }
 
 /// Get detailed info for a NixOS package or option.
 pub async fn info_nixos(app: &App, name: &str, info_type: &str, channel: &str) -> String {
-    let channels = app.caches.channels.resolved(&app.http).await;
-    let Some(index) = channels.get(channel) else {
-        return err(format!("Invalid channel '{channel}'. {}", channel_suggestions(&channels, channel).await));
-    };
-    let result = if info_type == "package" {
-        info_package(app, index, name, channel).await
-    } else {
-        info_option(app, index, name).await
-    };
-    result.unwrap_or_else(err)
-}
-
-async fn count_type(app: &App, url: &str, kind: &str) -> i64 {
-    let request = app.http.post_es(url, &json!({"query": {"term": {"type": kind}}}));
-    let data = app.http.send(request, 10).await.and_then(|resp| resp.json());
-    data.ok().and_then(|data| data.get("count").and_then(Value::as_i64)).unwrap_or(0)
+    with_nixos_index(app, channel, |index| async move {
+        if info_type == "package" {
+            info_package(app, &index, name, channel).await
+        } else {
+            info_option(app, &index, name).await
+        }
+    })
+    .await
 }
 
 /// Get NixOS package and option counts for a channel.
 pub async fn stats_nixos(app: &App, channel: &str) -> String {
-    let channels = app.caches.channels.resolved(&app.http).await;
-    let Some(index) = channels.get(channel) else {
-        return err(format!("Invalid channel '{channel}'. {}", channel_suggestions(&channels, channel).await));
-    };
-    let url = format!("{NIXOS_API}/{index}/_count");
-    let pkg_count = count_type(app, &url, "package").await;
-    let opt_count = count_type(app, &url, "option").await;
-    if pkg_count == 0 && opt_count == 0 {
-        return err("Failed to retrieve statistics");
-    }
-    format!("NixOS Statistics ({channel}):\n* Packages: {}\n* Options: {}", commas(pkg_count), commas(opt_count))
+    with_nixos_index(app, channel, |index| async move {
+        let (pkg_count, opt_count) =
+            tokio::try_join!(es_count(app, &index, "package"), es_count(app, &index, "option"))?;
+        Ok(format!(
+            "NixOS Statistics ({channel}):\n* Packages: {}\n* Options: {}",
+            commas(pkg_count),
+            commas(opt_count)
+        ))
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -70,7 +70,7 @@ async fn info_prefers_attribute_match_then_flags_pname_ambiguity() {
         ])
     });
     let text = call(&fixture.app(), json!({"action": "info", "query": "firefox"})).await;
-    assert!(text.starts_with("Package: firefox\nVersion: 2\n"), "{text}");
+    assert!(text.starts_with("Package: firefox\nAttribute: firefox\nVersion: 2\n"), "{text}");
     assert!(text.contains("Returned the canonical entry (firefox)."), "{text}");
     assert!(text.contains("pname: firefox-esr, firefox-mobile."), "{text}");
     assert!(text.contains(r#"{"action": "info", "query": "firefox-esr", "channel": "unstable"}"#), "{text}");
@@ -103,9 +103,39 @@ async fn info_reports_homepage_license_and_missing_packages() {
     });
     let app = fixture.app();
     let text = call(&app, json!({"action": "info", "query": "git"})).await;
-    assert_eq!(text, "Package: git\nVersion: 2\nHomepage: https://git-scm.com\nLicense: GPL-2.0, LGPL");
+    assert_eq!(text, "Package: git\nAttribute: git\nVersion: 2\nHomepage: https://git-scm.com\nLicense: GPL-2.0, LGPL");
     let text = call(&app, json!({"action": "info", "query": "nope"})).await;
     assert_eq!(text, "Error (NOT_FOUND): Package 'nope' not found");
+}
+
+#[tokio::test]
+async fn nixos_package_info_uses_result_revision_for_definition_link() {
+    let commit = "7".repeat(40);
+    let index = format!("nixos-53-unstable-{commit}");
+    let fixture = with_es(move |_| {
+        json_reply(json!({"hits": {"hits": [{
+            "_index": index, "_source": {
+                "package_pname": "requests", "package_attr_name": "python3Packages.requests",
+                "package_pversion": "2.32.5", "package_mainProgram": "requests-demo",
+                "package_programs": ["requests-demo"], "package_outputs": ["out", "dev"],
+                "package_default_output": "out", "package_platforms": ["aarch64-linux", "x86_64-linux"],
+                "package_position": "pkgs/development/python-modules/requests/default.nix:14"
+            }
+        }]}}))
+    });
+    let text = call(&fixture.app(), json!({"action":"info", "query":"python3Packages.requests"})).await;
+    for line in [
+        "Attribute: python3Packages.requests".to_owned(),
+        "Main program: requests-demo".to_owned(),
+        "Default output: out".to_owned(),
+        "Outputs: out, dev".to_owned(),
+        "Platforms: aarch64-linux, x86_64-linux".to_owned(),
+        format!(
+            "Declared in: https://github.com/NixOS/nixpkgs/blob/{commit}/pkgs/development/python-modules/requests/default.nix#L14"
+        ),
+    ] {
+        assert!(text.lines().any(|shown| shown == line), "missing {line:?} in {text}");
+    }
 }
 
 #[tokio::test]
@@ -116,15 +146,33 @@ async fn elasticsearch_failures_surface_as_api_errors() {
 }
 
 #[tokio::test]
-async fn stats_format_thousands_and_fail_when_both_counts_are_zero() {
+async fn stats_format_thousands_and_preserve_zero_counts() {
     let fixture = serve(|request| {
         if request.path.ends_with("/_count") && request.body.contains("package") {
             return json_reply(json!({"count": 123456}));
         }
+        if request.path.ends_with("/_count") && request.body.contains("option") {
+            return json_reply(json!({"count": 0}));
+        }
         search_backend(request).unwrap_or_else(|| status(404))
     });
     let text = call(&fixture.app(), json!({"action": "stats"})).await;
-    assert_eq!(text, "NixOS Statistics (unstable):\n* Packages: 123,456\n* Options: 1,234");
+    assert_eq!(text, "NixOS Statistics (unstable):\n* Packages: 123,456\n* Options: 0");
+}
+
+#[tokio::test]
+async fn stats_report_upstream_failures_instead_of_zero() {
+    let fixture = serve(|request| {
+        if request.path.contains("group-manual/_count") || request.body.contains("option") {
+            return Reply { status: 502, ..json_reply(json!({"error": "bad gateway"})) };
+        }
+        search_backend(request).unwrap_or_else(|| status(404))
+    });
+    let app = fixture.app();
+    for source in ["nixos", "flakes"] {
+        let text = call(&app, json!({"action": "stats", "source": source})).await;
+        assert!(text.starts_with("Error (ERROR): API error: 502"), "{text}");
+    }
 }
 
 fn catalogue(path: &str) -> Option<Reply> {
@@ -374,7 +422,23 @@ async fn flakes_group_by_repository() {
         ]}}))
     });
     let text = call(&fixture.app(), json!({"action": "search", "source": "flakes", "query": "a"})).await;
-    assert_eq!(text, "Found 9 matches (1 unique flakes) for 'a':\n\n* a\n  Repository: o/r\n  D\n  Packages: x, y");
+    assert_eq!(
+        text,
+        "Showing 1 flake for 'a' (9 matching package records):\n\n* a\n  Repository: o/r\n  D\n  Packages: x, y"
+    );
+}
+
+#[tokio::test]
+async fn flake_search_limit_applies_after_grouping() {
+    let fixture = with_es(|_| {
+        es_hits(vec![
+            json!({"flake_name": "first", "package_attr_name": "a"}),
+            json!({"flake_name": "first", "package_attr_name": "b"}),
+            json!({"flake_name": "second", "package_attr_name": "c"}),
+        ])
+    });
+    let text = call(&fixture.app(), json!({"action": "search", "source": "flakes", "query": "test", "limit": 1})).await;
+    assert_eq!(text, "Showing 1 flake for 'test' (3 matching package records):\n\n* first\n  Packages: a, b");
 }
 
 #[tokio::test]
@@ -413,8 +477,8 @@ fn resolve_reply() -> Reply {
     json_reply(json!({"name": "hello", "version": "2.12", "systems": {
         "x86_64-linux": {
             "flake_installable": {"attr_path": "hello",
-                "ref": {"type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "0123456789abcdef"}},
-            "outputs": [{"path": format!("/nix/store/{hash}-hello"), "default": true}]},
+                "ref": {"type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "0123456789abcdef0123456789abcdef01234567"}},
+            "outputs": [{"name": "out", "path": format!("/nix/store/{hash}-hello"), "default": true}]},
         "aarch64-darwin": {"outputs": []}
     }}))
 }
@@ -429,7 +493,10 @@ async fn binary_cache_reports_per_system_status() {
             return if request.method == "HEAD" {
                 status(200)
             } else {
-                ok("FileSize: 2048\nNarSize: 4096\nCompression: zstd\n")
+                ok(format!(
+                    "StorePath: /nix/store/{}-hello\nFileSize: 2048\nNarSize: 4096\nCompression: zstd\n",
+                    "a".repeat(32)
+                ))
             };
         }
         status(404)
@@ -440,11 +507,12 @@ async fn binary_cache_reports_per_system_status() {
     assert_eq!(
         text,
         format!(
-            "Binary Cache Status: hello@2.12\n\nSystem: x86_64-linux\n  Store path: /nix/store/{hash}-hello\n  \
+            "Binary Cache Status: hello@2.12\nCache: https://cache.nixos.org (NixHub resolution)\n\nSystem: x86_64-linux\n  Flake reference: github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567#hello\n  Output: out\n  Store path: /nix/store/{hash}-hello\n  \
              Status: CACHED\n  Download size: 2.0 KB\n  Unpacked size: 4.0 KB\n  Compression: zstd\n\n\
              System: aarch64-darwin\n  Store path: Not available\n  Status: UNKNOWN"
         )
     );
+    assert_eq!(fixture.count(".narinfo"), 1);
     let filtered = call(&app, json!({"action": "cache", "query": "hello", "system": "riscv"})).await;
     assert_eq!(filtered, "Error (NOT_FOUND): System 'riscv' not available. Available: aarch64-darwin, x86_64-linux");
     let missing = call(&app, json!({"action": "cache", "query": "nope"})).await;
@@ -481,7 +549,10 @@ async fn nixhub_info_merges_pkg_and_resolve() {
     });
     let text = call(&fixture.app(), json!({"action": "info", "source": "nixhub", "query": "hello"})).await;
     assert!(text.starts_with("Package: hello\nVersion: 2.12\nSummary: Greets\n\nLicense: GPL\nHomepage: https://h\n"));
-    assert!(text.contains("Flake Reference:\n  github:NixOS/nixpkgs/01234567#hello"), "{text}");
+    assert!(
+        text.contains("Flake Reference:\n  github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567#hello"),
+        "{text}"
+    );
     assert!(text.contains("Store Paths:\n  x86_64-linux: /nix/store/"), "{text}");
 }
 
@@ -533,6 +604,8 @@ async fn routing_rejects_bad_arguments_with_guidance() {
         (json!({"action": "browse", "source": "wiki"}), "home-manager, darwin, nixvim, nvf, noogle"),
         (json!({"action": "stats", "source": "wiki"}), "Stats not available for source=wiki."),
         (json!({"action": "info", "source": "flakes", "query": "x"}), "not supported for source=flakes"),
+        (json!({"action": "cache", "channel": "stable", "query": "ripgrep"}), "does not support a channel"),
+        (json!({"action": "cache", "channel": "unstable", "query": "ripgrep"}), "does not support a channel"),
         (json!({"action": "cache"}), "Package name required for cache action"),
         (json!({"action": "store", "type": "read", "query": "/nix/store/x", "limit": 2001}), "Limit must be 1-2000"),
         (json!({"action": "store", "type": "bogus", "query": "x"}), "Type must be one of: ls, read for store"),

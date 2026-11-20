@@ -7,6 +7,12 @@ search.nixos.org, or running `gh api` against NixOS/nixpkgs.
 
 INTENTS → CALLS (copy the JSON shape exactly):
   "is package X in channel Y?"        → {"action": "info", "query": "X", "channel": "Y"}
+  "is X in my locked nixpkgs?"         → {"action":"info","source":"pinned","query":"X","system":"x86_64-linux"}
+  "list project pins without fetching" → {"action":"flake-inputs","type":"lock","flake_dir":"."}
+  "find packages in NUR"               → {"action":"search","source":"nur","query":"firefox"}
+  "which package ships this file?"     → {"action":"search","source":"nix-locate","query":"include/zlib.h"}
+  "get a MicroVM host or guest option" → {"action":"info","source":"microvm","query":"microvm.hypervisor"}
+  "get a flake-parts core option"      → {"action":"info","source":"flake-parts","query":"perSystem.packages"}
   "search for package X"              → {"action": "search", "query": "X"}
   "which channels are available?"     → {"action": "channels"}
   "which commit did channel X index?" → {"action": "channels"}  (indexed commit shown when known;
@@ -17,7 +23,7 @@ INTENTS → CALLS (copy the JSON shape exactly):
   "darwin option for X"               → {"action": "search", "query": "X", "source": "darwin"}
   "nixvim option for X"               → {"action": "search", "query": "X", "source": "nixvim"}
   "NVF option for X"                  → {"action": "search", "query": "X", "source": "nvf"}
-  "what programs does pkg X provide?" → {"action": "search", "query": "X", "type": "programs"}
+  "which package provides program X?" → {"action": "search", "query": "X", "type": "programs"}
   "count packages/options"            → {"action": "stats"}
   "browse hm option tree under P"     → {"action": "browse", "query": "P", "source": "home-manager"}
   "does X have a binary cache?"       → {"action": "cache", "query": "X"}
@@ -35,7 +41,7 @@ use the separate `nix_versions` tool — it returns commit hashes, attribute pat
 Notes:
   - To search NixOS *options*, use action=search with type=options. Do NOT use action=browse
     for source=nixos — browse is for walking a pre-indexed option tree and only works with
-    home-manager, darwin, nixvim, nvf, or noogle.
+    home-manager, darwin, nixvim, nvf, microvm, flake-parts, or noogle.
   - For source=nvf, canonical option paths are vim.*. The shorthand programs.nvf.vim.* and
     NixOS/Home Manager module path programs.nvf.settings.vim.* are normalized automatically.
   - For source=nix-dev, action=info returns the page markdown. The query may be a bare
@@ -44,4 +50,5 @@ Notes:
   - action=info for packages matches on the exact attribute path first, then the exact pname.
     If multiple packages share a pname (e.g. firefox / firefox-esr / firefox-mobile), the
     canonical attribute wins and the response flags the disambiguation explicitly.
+  - Cache checks resolve a NixHub version and selected output on cache.nixos.org. Omit channel.
   - Omit parameters you don't need; do not pass empty strings for optional args.

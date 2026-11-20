@@ -50,7 +50,7 @@ export default defineConfig({
       {
         text: 'Resources',
         items: [
-          { text: 'GitHub', link: 'https://github.com/timfewi/mcp-nixos-rust' },
+          { text: 'GitHub', link: 'https://github.com/timfewi/nixos-mcp-rust' },
           { text: 'Original Python server', link: 'https://github.com/utensils/mcp-nixos' },
         ],
       },
@@ -100,11 +100,11 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/timfewi/mcp-nixos-rust' },
+      { icon: 'github', link: 'https://github.com/timfewi/nixos-mcp-rust' },
     ],
 
     editLink: {
-      pattern: 'https://github.com/timfewi/mcp-nixos-rust/edit/main/website/:path',
+      pattern: 'https://github.com/timfewi/nixos-mcp-rust/edit/main/website/:path',
       text: 'Edit this page on GitHub',
     },
 

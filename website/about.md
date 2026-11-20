@@ -160,9 +160,9 @@ PR — flake check, Nix build, clippy, rustfmt, and tests.
 
 <div style="display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.5rem 0;">
 
-[GitHub Repository](https://github.com/timfewi/mcp-nixos-rust){.vp-button.vp-button-brand}
-[Report Issues](https://github.com/timfewi/mcp-nixos-rust/issues){.vp-button.vp-button-alt}
-[Release Notes](https://github.com/timfewi/mcp-nixos-rust/blob/main/RELEASE_NOTES.md){.vp-button.vp-button-alt}
+[GitHub Repository](https://github.com/timfewi/nixos-mcp-rust){.vp-button.vp-button-brand}
+[Report Issues](https://github.com/timfewi/nixos-mcp-rust/issues){.vp-button.vp-button-alt}
+[Release Notes](https://github.com/timfewi/nixos-mcp-rust/blob/main/RELEASE_NOTES.md){.vp-button.vp-button-alt}
 
 </div>
 

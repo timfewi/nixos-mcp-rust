@@ -47,7 +47,7 @@
 
           meta = {
             inherit (manifest.package) description;
-            homepage = "https://github.com/timfewi/mcp-nixos-rust";
+            homepage = "https://github.com/timfewi/nixos-mcp-rust";
             license = pkgs.lib.licenses.mit;
             mainProgram = "mcp-nixos";
           };
@@ -135,7 +135,7 @@
             default = mcp-nixos;
 
             docker = pkgs.dockerTools.buildLayeredImage {
-              name = "ghcr.io/timfewi/mcp-nixos-rust";
+              name = "ghcr.io/timfewi/nixos-mcp-rust";
               tag = mcp-nixos.version;
               # Format: YYYYMMDDHHMMSS -> YYYY-MM-DDTHH:MM:SSZ
               created =
@@ -179,6 +179,7 @@
 
             packages = [
               pkgs.cargo
+              pkgs.cargo-audit
               pkgs.rustc
               pkgs.rustfmt
               pkgs.clippy

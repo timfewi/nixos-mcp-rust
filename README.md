@@ -14,14 +14,14 @@ protocols use the same Rust tool implementation; no Python runtime or bridge is 
 
 ### Option 1: Nix
 
-[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=nixos&config=eyJjb21tYW5kIjoibml4IHJ1biBnaXRodWI6dGltZmV3aS9tY3Atbml4b3MtcnVzdCAtLSJ9)
+[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=nixos&config=eyJjb21tYW5kIjoibml4IHJ1biBnaXRodWI6dGltZmV3aS9uaXhvcy1tY3AtcnVzdCAtLSJ9)
 
 ```json
 {
   "mcpServers": {
     "nixos": {
       "command": "nix",
-      "args": ["run", "github:timfewi/mcp-nixos-rust", "--"]
+      "args": ["run", "github:timfewi/nixos-mcp-rust", "--"]
     }
   }
 }
@@ -32,7 +32,7 @@ Your AI now has access to real NixOS data instead of making things up. You're we
 ### Option 2: Cargo
 
 ```bash
-cargo install --git https://github.com/timfewi/mcp-nixos-rust
+cargo install --git https://github.com/timfewi/nixos-mcp-rust
 ```
 
 ```json
@@ -139,17 +139,17 @@ Just two. We consolidated 17 tools into 2 because your AI's context window isn't
 One tool to rule them all:
 
 ```text
-nix(action, query, source, type, channel, limit, version, system)
+nix(action, query, source, type, channel, limit, version, system, flake_dir, input)
 ```
 
-`version` and `system` are only used by `action="cache"`.
+Cache checks resolve a NixHub version and report the selected output on cache.nixos.org. Omit `channel`. Use `system` to select the architecture.
 
 | Action | What it does |
 |--------|-------------|
 | `search` | Search packages, options, programs, or flakes |
 | `info` | Get detailed info about a package or option |
 | `stats` | Get counts and categories |
-| `browse` | Browse Home Manager, Darwin, Nixvim, NVF, or Noogle by prefix (legacy alias: `options`) |
+| `browse` | Browse Home Manager, Darwin, Nixvim, NVF, MicroVM.nix, flake-parts core, or Noogle by prefix (legacy alias: `options`) |
 | `channels` | List available NixOS channels |
 | `flake-inputs` | Explore local flake inputs from Nix store |
 | `cache` | Check binary cache status for packages |
@@ -168,6 +168,22 @@ nix(action, query, source, type, channel, limit, version, system)
 | `wiki` | NixOS Wiki articles (wiki.nixos.org) |
 | `nix-dev` | Official Nix documentation (nix.dev) |
 | `nixhub` | Package metadata and store paths (nixhub.io) |
+| `pinned` | Exact package information from a local flake’s locked nixpkgs-compatible input |
+| `microvm` | Published host and guest options from MicroVM.nix |
+| `flake-parts` | Published flake-parts core options |
+| `nur` | Community packages with NUR attribute paths and index revision |
+| `nix-locate` | Files provided by packages in a local nix-index database |
+
+```text
+nix(action="info", source="pinned", query="ripgrep", flake_dir=".", input="nixpkgs", system="x86_64-linux")
+nix(action="flake-inputs", type="lock", flake_dir=".")
+nix(action="info", source="microvm", query="microvm.vms")
+nix(action="browse", source="flake-parts", query="perSystem")
+nix(action="search", source="nur", query="firefox")
+nix(action="search", source="nix-locate", query="include/zlib.h")
+```
+
+Pinned lookup needs Nix and a local project with a lockfile. The lock listing reads the file directly. For file lookup, put `nix-locate` on PATH and provide a nix-index database. Set `NIX_INDEX_DATABASE` to its directory to select a particular snapshot.
 
 NVF results use canonical `vim.*` option paths. Queries may also use the shorthand
 `programs.nvf.vim.*` or the NixOS/Home Manager module path
@@ -286,14 +302,14 @@ nix_versions(package="nodejs", version="20.0.0")
 **You DON'T need Nix installed.** The server is a single binary:
 
 ```bash
-cargo install --git https://github.com/timfewi/mcp-nixos-rust
+cargo install --git https://github.com/timfewi/nixos-mcp-rust
 ```
 
 For Nix users:
 
 ```bash
-nix run github:timfewi/mcp-nixos-rust
-nix profile install github:timfewi/mcp-nixos-rust
+nix run github:timfewi/nixos-mcp-rust
+nix profile install github:timfewi/nixos-mcp-rust
 ```
 
 ### Declarative Installation (NixOS / Home Manager / nix-darwin)
@@ -320,7 +336,7 @@ Or use the flake directly with the provided overlay:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    mcp-nixos.url = "github:timfewi/mcp-nixos-rust";
+    mcp-nixos.url = "github:timfewi/nixos-mcp-rust";
   };
 
   outputs = { self, nixpkgs, mcp-nixos, ... }: {

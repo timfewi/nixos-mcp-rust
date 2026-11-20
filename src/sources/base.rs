@@ -1,5 +1,7 @@
 //! Functionality shared across data sources.
 
+use std::fmt;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -51,14 +53,70 @@ pub async fn es_query(
     size: i64,
     rescore: Option<Value>,
 ) -> Result<Vec<Value>, String> {
+    es_query_with_status(app, index, query, size, rescore).await.map_err(|failure| failure.to_string())
+}
+
+pub(crate) async fn es_query_with_status(
+    app: &App,
+    index: &str,
+    query: Value,
+    size: i64,
+    rescore: Option<Value>,
+) -> Result<Vec<Value>, EsError> {
     let mut body = json!({"query": query, "size": size});
     if let Some(rescore) = rescore {
         body["rescore"] = rescore;
     }
-    let request = app.http.post_es(&format!("{NIXOS_API}/{index}/_search"), &body);
-    let describe = |failure: FetchError| format!("API error: {failure}");
-    let data = app.http.send(request, 10).await.and_then(|resp| resp.ok()?.json()).map_err(describe)?;
-    Ok(data.pointer("/hits/hits").and_then(Value::as_array).cloned().unwrap_or_default())
+    let data = es_response(app, index, "_search", &body).await?;
+    data.pointer("/hits/hits").and_then(Value::as_array).cloned().ok_or_else(|| EsError::invalid("hits.hits"))
+}
+
+#[derive(Debug)]
+pub(crate) struct EsError(FetchError);
+
+impl EsError {
+    pub(crate) fn invalid(field: &str) -> Self {
+        Self(FetchError::Parse(format!("Invalid Elasticsearch response field: {field}")))
+    }
+
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self.0, FetchError::Status(404, _))
+    }
+}
+
+impl fmt::Display for EsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "API error: {}", self.0)
+    }
+}
+
+pub(crate) async fn es_response(app: &App, index: &str, operation: &str, body: &Value) -> Result<Value, EsError> {
+    let request = app.http.post_es(&format!("{NIXOS_API}/{index}/{operation}"), body);
+    app.http.send(request, 10).await.and_then(|resp| resp.ok()?.json()).map_err(EsError)
+}
+
+pub(crate) async fn es_count(app: &App, index: &str, kind: &str) -> Result<i64, EsError> {
+    let data = es_response(app, index, "_count", &json!({"query": {"term": {"type": kind}}})).await?;
+    data.get("count").and_then(Value::as_i64).filter(|count| *count >= 0).ok_or_else(|| EsError::invalid("count"))
+}
+
+pub(crate) async fn with_nixos_index<F>(app: &App, channel: &str, mut run: impl FnMut(String) -> F) -> String
+where
+    F: Future<Output = Result<String, EsError>> + Send,
+{
+    let channels = app.caches.channels.resolved(&app.http).await;
+    let Some(index) = channels.get(channel) else {
+        return err(format!("Invalid channel '{channel}'. {}", channel_suggestions(&channels, channel).await));
+    };
+    let result = run(index.clone()).await;
+    if result.as_ref().is_err_and(EsError::is_not_found) {
+        app.caches.channels.refresh_after_404(index).await;
+        let updated = app.caches.channels.resolved(&app.http).await;
+        if let Some(index) = updated.get(channel) {
+            return run(index.clone()).await.unwrap_or_else(err);
+        }
+    }
+    result.unwrap_or_else(err)
 }
 
 fn is_release(name: &str) -> bool {
@@ -82,7 +140,7 @@ fn channel_to_branch(name: &str, index: &str) -> String {
 }
 
 /// The commit embedded in an unstable ES index name, if any.
-fn embedded_commit(index: &str) -> Option<&str> {
+pub(crate) fn embedded_commit(index: &str) -> Option<&str> {
     let (_, commit) = index.rsplit_once('-')?;
     (commit.len() == 40 && commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then_some(commit)
 }
@@ -98,7 +156,9 @@ enum Revision {
 }
 
 async fn channel_revision(app: &App, name: &str, index: &str) -> Revision {
-    if let Some(commit) = embedded_commit(index) {
+    if let Some(target) = app.caches.channels.indexed_target(index).await
+        && let Some(commit) = embedded_commit(&target)
+    {
         return Revision::Indexed(commit.to_owned());
     }
     let branch = channel_to_branch(name, index);

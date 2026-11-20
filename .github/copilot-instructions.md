@@ -36,7 +36,7 @@ build                    # cargo build --release
 ## CI/CD & Release Process
 
 - **CI runs on all PRs:** flake check, Nix build, clippy, rustfmt, tests
-- **Releases:** no registry publishing; consumers pin the flake from `github:timfewi/mcp-nixos-rust`
+- **Releases:** no registry publishing; consumers pin the flake from `github:timfewi/nixos-mcp-rust`
 - **Commit convention:** `type: summary` format (feat:, fix:, docs:, refactor:, test:, chore:)
 
 ## Common Pitfalls

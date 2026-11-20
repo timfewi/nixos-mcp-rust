@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::{StreamExt, stream};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell};
@@ -22,9 +23,8 @@ pub type Channels = IndexMap<String, String>;
 /// After a failed alias probe, serve the fallback for this long before spending
 /// another round of requests: fallback results are deliberately not memoized.
 const DISCOVERY_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
-/// An alias observed empty means Hydra is mid-publish, so a snapshot taken then
-/// expires instead of pinning the process to the older generation.
-const ROLLOVER_RECHECK: Duration = Duration::from_secs(300);
+const CHANNEL_TTL: Duration = Duration::from_secs(300);
+const COUNT_CONCURRENCY: usize = 8;
 
 fn fallback_channels() -> Channels {
     FALLBACK_CHANNELS.iter().map(|(name, index)| ((*name).to_owned(), (*index).to_owned())).collect()
@@ -46,14 +46,11 @@ fn release_key(version: &str) -> Vec<u64> {
     version.split('.').filter_map(|part| part.parse().ok()).collect()
 }
 
-/// Discovered channels and resolved mappings. Alias *names* and their document
-/// counts are cached separately: names are what resolution needs, counts are
-/// display-only, and a partial `_count` failure must not shrink the set of
-/// channels we can resolve.
+/// Alias targets preserve index provenance while count probes detect empty indices.
 #[derive(Default)]
 struct ChannelState {
-    alias_names: Option<Vec<String>>,
-    flake_index: Option<String>,
+    aliases: Channels,
+    discovered_at: Option<Instant>,
     /// Aliases whose `_count` came back 200 with zero documents. Hydra publishes
     /// the alias before the index fills, so these must not win resolution. An
     /// alias whose probe merely failed stays a candidate.
@@ -62,85 +59,98 @@ struct ChannelState {
     resolved: Option<Channels>,
     using_fallback: bool,
     failed_at: Option<Instant>,
-    rollover_at: Option<Instant>,
+    refreshed_after_404: HashMap<String, Instant>,
 }
 
 impl ChannelState {
-    fn expire_rollover(&mut self) {
-        if self.rollover_at.is_some_and(|at| at.elapsed() >= ROLLOVER_RECHECK) {
-            *self = Self { failed_at: self.failed_at, using_fallback: self.using_fallback, ..Self::default() };
+    fn clear_snapshot(&mut self) {
+        self.aliases.clear();
+        self.discovered_at = None;
+        self.empty_aliases.clear();
+        self.available = None;
+        self.resolved = None;
+    }
+
+    fn expire(&mut self) {
+        if self.discovered_at.is_some_and(|at| at.elapsed() >= CHANNEL_TTL) {
+            self.clear_snapshot();
         }
     }
 
-    async fn list_aliases(&mut self, http: &Http) -> Vec<String> {
-        let request = http.get(&format!("{NIXOS_API}/_cat/aliases?format=json"));
+    async fn list_aliases(http: &Http) -> Channels {
+        let request = http.get(&format!("{NIXOS_API}/_cat/aliases?format=json&h=alias,index"));
         let request = request.basic_auth(crate::config::NIXOS_AUTH.0, Some(crate::config::NIXOS_AUTH.1));
         let entries = match http.send(request, 10).await {
             Ok(resp) if resp.status() == 200 => resp.json().unwrap_or(Value::Null),
-            _ => return Vec::new(),
+            _ => return Channels::new(),
         };
-        let names: Vec<String> =
-            entries.as_array().into_iter().flatten().map(|entry| str_of(entry, "alias").to_owned()).collect();
-        // The flake alias comes from the same response so flake queries do not
-        // need a probe of their own.
-        if let Some(best) = names.iter().filter_map(|n| Some((parse_flake_alias(n)?, n))).max() {
-            self.flake_index = Some(best.1.clone());
-        }
-        names.into_iter().filter(|name| parse_channel_alias(name).is_some()).collect()
-    }
-
-    /// Live alias names, cached once a probe succeeds. A failed probe is not
-    /// cached, but it starts a cooldown so an outage does not make every caller
-    /// pay for its own round of requests.
-    async fn aliases(&mut self, http: &Http) -> Vec<String> {
-        if let Some(names) = &self.alias_names {
-            return names.clone();
-        }
-        if self.failed_at.is_some_and(|at| at.elapsed() < DISCOVERY_RETRY_COOLDOWN) {
-            return Vec::new();
-        }
-        let aliases = self.list_aliases(http).await;
-        if aliases.is_empty() {
-            self.failed_at = Some(Instant::now());
-        } else {
-            self.alias_names = Some(aliases.clone());
-            self.failed_at = None;
+        let mut aliases = Channels::new();
+        for entry in entries.as_array().into_iter().flatten() {
+            let alias = str_of(entry, "alias");
+            if parse_channel_alias(alias).is_none() && parse_flake_alias(alias).is_none() {
+                continue;
+            }
+            let target = str_of(entry, "index");
+            aliases
+                .entry(alias.to_owned())
+                .and_modify(|known| {
+                    if known != target {
+                        known.clear();
+                    }
+                })
+                .or_insert_with(|| target.to_owned());
         }
         aliases
     }
 
+    async fn discover(&mut self, http: &Http) {
+        if self.discovered_at.is_some() || self.failed_at.is_some_and(|at| at.elapsed() < DISCOVERY_RETRY_COOLDOWN) {
+            return;
+        }
+        self.aliases = Self::list_aliases(http).await;
+        if self.aliases.is_empty() {
+            self.failed_at = Some(Instant::now());
+        } else {
+            self.discovered_at = Some(Instant::now());
+            self.failed_at = None;
+        }
+    }
+
     /// Map each live alias to its document count, caching only a complete
-    /// listing: a partial one would report channels as Unavailable for the life
-    /// of the process.
+    /// listing so a partial failure can recover before the next discovery.
     async fn available(&mut self, http: &Http) -> Channels {
         if let Some(counted) = &self.available {
             return counted.clone();
         }
-        let aliases = self.aliases(http).await;
+        self.discover(http).await;
+        let aliases: Vec<_> = self.aliases.keys().filter(|name| parse_channel_alias(name).is_some()).cloned().collect();
         let mut complete = !aliases.is_empty();
         let mut counted = Channels::new();
         let mut empty = HashSet::new();
-        for alias in aliases {
-            let body = json!({"query": {"match_all": {}}});
-            let request = http.post_es(&format!("{NIXOS_API}/{alias}/_count"), &body);
-            match http
-                .send(request, 10)
-                .await
-                .and_then(|resp| if resp.status() == 200 { resp.json().map(Some) } else { Ok(None) })
-            {
-                Ok(Some(data)) => match data.get("count").and_then(Value::as_i64).unwrap_or(0) {
-                    count if count > 0 => {
-                        counted.insert(alias, format!("{} documents", commas(count)));
-                    }
-                    _ => {
-                        empty.insert(alias);
-                    }
-                },
+        let mut probes = stream::iter(aliases)
+            .map(|alias| async move {
+                let request =
+                    http.post_es(&format!("{NIXOS_API}/{alias}/_count"), &json!({"query": {"match_all": {}}}));
+                let count = http
+                    .send(request, 10)
+                    .await
+                    .and_then(|resp| resp.ok()?.json())
+                    .ok()
+                    .and_then(|data| data.get("count")?.as_i64());
+                (alias, count)
+            })
+            .buffered(COUNT_CONCURRENCY);
+        while let Some((alias, count)) = probes.next().await {
+            match count {
+                Some(count) if count > 0 => {
+                    counted.insert(alias, format!("{} documents", commas(count)));
+                }
+                Some(0) => {
+                    empty.insert(alias);
+                }
                 _ => complete = false,
             }
         }
-        // Start (or clear) the rollover clock for this snapshot.
-        self.rollover_at = (!empty.is_empty()).then(Instant::now);
         self.empty_aliases = empty;
         if complete {
             self.available = Some(counted.clone());
@@ -150,8 +160,8 @@ impl ChannelState {
 
     /// Returns `(mapping, used_fallback, cacheable)`.
     async fn resolve(&mut self, http: &Http) -> (Channels, bool, bool) {
-        let aliases = self.aliases(http).await;
-        if aliases.is_empty() {
+        self.discover(http).await;
+        if self.aliases.is_empty() {
             return (fallback_channels(), true, false);
         }
         // Count probes let confirmed-empty aliases be skipped; `available` is
@@ -161,7 +171,7 @@ impl ChannelState {
         let cacheable = self.available.is_some();
 
         let mut by_channel: HashMap<String, (u64, String)> = HashMap::new();
-        for alias in aliases.iter().filter(|alias| !self.empty_aliases.contains(*alias)) {
+        for alias in self.aliases.keys().filter(|alias| !self.empty_aliases.contains(*alias)) {
             if let Some((generation, channel)) = parse_channel_alias(alias) {
                 let best = by_channel.entry(channel.to_owned()).or_insert((generation, alias.clone()));
                 if (generation, alias) > (best.0, &best.1) {
@@ -199,7 +209,7 @@ pub struct ChannelCache {
 impl ChannelCache {
     pub async fn resolved(&self, http: &Http) -> Channels {
         let mut state = self.state.lock().await;
-        state.expire_rollover();
+        state.expire();
         if let Some(resolved) = &state.resolved {
             return resolved.clone();
         }
@@ -215,7 +225,7 @@ impl ChannelCache {
 
     pub async fn available(&self, http: &Http) -> Channels {
         let mut state = self.state.lock().await;
-        state.expire_rollover();
+        state.expire();
         state.available(http).await
     }
 
@@ -223,14 +233,33 @@ impl ChannelCache {
         self.state.lock().await.using_fallback
     }
 
+    pub(crate) async fn indexed_target(&self, alias: &str) -> Option<String> {
+        self.state.lock().await.aliases.get(alias).filter(|target| !target.is_empty()).cloned()
+    }
+
+    pub(crate) async fn refresh_after_404(&self, alias: &str) {
+        let mut state = self.state.lock().await;
+        state.refreshed_after_404.retain(|_, at| at.elapsed() < DISCOVERY_RETRY_COOLDOWN);
+        if (state.discovered_at.is_some() && !state.aliases.contains_key(alias))
+            || state.refreshed_after_404.contains_key(alias)
+        {
+            return;
+        }
+        state.refreshed_after_404.insert(alias.to_owned(), Instant::now());
+        state.clear_snapshot();
+    }
+
     /// Live `latest-<gen>-group-manual` alias, or the `FLAKE_INDEX` fallback.
     pub async fn flake_index(&self, http: &Http) -> String {
         let mut state = self.state.lock().await;
-        state.expire_rollover();
-        if state.flake_index.is_none() {
-            state.aliases(http).await;
-        }
-        state.flake_index.clone().unwrap_or_else(|| FLAKE_INDEX.to_owned())
+        state.expire();
+        state.discover(http).await;
+        state
+            .aliases
+            .keys()
+            .filter_map(|alias| Some((parse_flake_alias(alias)?, alias)))
+            .max()
+            .map_or_else(|| FLAKE_INDEX.to_owned(), |(_, alias)| alias.clone())
     }
 }
 
@@ -447,7 +476,9 @@ type Shared<T> = OnceCell<Arc<T>>;
 
 #[derive(Default)]
 pub struct Caches {
+    pub(crate) nur: crate::sources::nur::NurCache,
     pub channels: ChannelCache,
+    pub(crate) module_options: crate::sources::module_options::ModuleOptionsCache,
     pub branch_revs: Mutex<HashMap<String, (String, Instant)>>,
     home_manager: Shared<Vec<HtmlOption>>,
     darwin: Shared<Vec<HtmlOption>>,
@@ -595,17 +626,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rollover_snapshots_expire() {
+    fn healthy_channel_snapshots_expire() {
         let mut state = ChannelState {
-            alias_names: Some(vec!["latest-50-nixos-unstable".to_owned()]),
-            rollover_at: Some(Instant::now()),
+            aliases: [("latest-50-nixos-unstable".to_owned(), "index".to_owned())].into_iter().collect(),
+            discovered_at: Some(Instant::now()),
+            resolved: Some(fallback_channels()),
             ..ChannelState::default()
         };
-        state.expire_rollover();
-        assert!(state.alias_names.is_some(), "a fresh snapshot stays");
-        state.rollover_at = Instant::now().checked_sub(ROLLOVER_RECHECK);
-        state.expire_rollover();
-        assert!(state.alias_names.is_none() && state.rollover_at.is_none());
+        state.expire();
+        assert_eq!(state.aliases.len(), 1, "a fresh snapshot stays");
+        state.discovered_at = Instant::now().checked_sub(CHANNEL_TTL);
+        state.expire();
+        assert!(state.aliases.is_empty());
+        assert!(state.discovered_at.is_none());
+        assert!(state.resolved.is_none());
     }
 
     #[test]

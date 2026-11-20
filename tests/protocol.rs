@@ -5,8 +5,9 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::*;
 use serde_json::{Value, json};
@@ -111,7 +112,7 @@ fn tool_calls_are_self_contained() {
     let mut server = Server::spawn(&fixture.url);
     let reply = server.call(1, json!({"action": "stats", "source": "wiki"}));
     assert_eq!(reply["result"]["resultType"], "complete");
-    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(reply["result"]["isError"], true);
     assert_eq!(reply["result"]["content"][0]["text"], "Error (ERROR): Stats not available for source=wiki.");
 }
 
@@ -151,6 +152,7 @@ fn legacy_handshake_serves_configured_clients() {
     }}));
     let reply = server.receive();
     assert_eq!(reply["id"], 3);
+    assert_eq!(reply["result"]["isError"], true);
     assert_eq!(reply["result"]["content"][0]["text"], "Error (ERROR): Stats not available for source=wiki.");
     assert_eq!(fixture.count("wiki"), 0, "local validation must not make an upstream request");
 }
@@ -162,6 +164,7 @@ fn bad_arguments_are_tool_text_and_unknown_tools_are_protocol_errors() {
     let reply = server.call(1, json!({"action": "search", "bogus": true}));
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.starts_with("Error (ERROR): Invalid arguments for tool 'nix'") && text.contains("bogus"), "{text}");
+    assert_eq!(reply["result"]["isError"], true);
     let reply = server.request(2, "tools/call", json!({"name": "nope", "arguments": {}}));
     assert_eq!(reply["error"]["code"], -32602);
 }
@@ -227,4 +230,41 @@ fn store_reads_go_through_the_tool_surface() {
     let reply = server.call(1, json!({"action": "store", "type": "ls", "query": "/etc"}));
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text, "Error (INVALID_PATH): Invalid store path: must stay within /nix/store/, got '/etc'");
+}
+
+#[test]
+fn flake_lock_lookup_resolves_follows_from_disk_over_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    struct ScratchDir(PathBuf);
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let dir = std::env::temp_dir().join(format!("mcp-nixos-lock-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    let scratch = ScratchDir(dir);
+    let path = scratch.0.join("flake.lock");
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    let lock = json!({"root":"root", "version":7, "nodes":{
+        "root":{"inputs":{"parts":"parts", "pkgs":"pin"}},
+        "parts":{"inputs":{"nixpkgs":["pkgs"]}},
+        "pin":{"locked":{"type":"github", "owner":"NixOS", "repo":"nixpkgs", "rev":revision}}
+    }})
+    .to_string();
+    std::fs::write(&path, &lock)?;
+
+    let fixture = offline();
+    let mut server = Server::spawn(&fixture.url);
+    let reply =
+        server.call(1, json!({"action":"flake-inputs", "type":"lock", "flake_dir":scratch.0, "query":"parts/nixpkgs"}));
+    let text = reply.pointer("/result/content/0/text").and_then(Value::as_str).ok_or("missing tool text")?;
+    assert_eq!(
+        text,
+        format!("Input: parts/nixpkgs\nFollows: pkgs\nSource: NixOS/nixpkgs\nType: github\nLock revision: {revision}")
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, lock);
+    assert_eq!(fixture.count("/"), 0);
+    Ok(())
 }

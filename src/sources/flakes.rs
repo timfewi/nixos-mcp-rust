@@ -1,13 +1,15 @@
 //! NixOS flakes search via search.nixos.org.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::config::NIXOS_API;
 use crate::text::{commas, ellipsize, err, str_of, strip};
+
+use super::base::{EsError, es_count, es_response};
 
 #[derive(Default)]
 struct Flake {
@@ -94,26 +96,25 @@ fn group_hits(hits: &[Value]) -> IndexMap<String, Flake> {
     flakes
 }
 
-async fn run_search(app: &App, query: &str, limit: i64) -> Result<String, String> {
-    let flake_index = app.caches.channels.flake_index(&app.http).await;
+async fn run_search(app: &App, index: &str, query: &str, limit: i64) -> Result<String, EsError> {
     let search = json!({"bool": {"filter": [{"term": {"type": "package"}}], "must": [flake_query(query)]}});
     let body = json!({"query": search, "size": limit * 5, "track_total_hits": true});
-    let request = app.http.post_es(&format!("{NIXOS_API}/{flake_index}/_search"), &body);
-    let data = app.http.send(request, 10).await.and_then(|resp| resp.ok()?.json()).map_err(|e| e.to_string())?;
-
-    let hits = data.pointer("/hits/hits").and_then(Value::as_array).cloned().unwrap_or_default();
-    let total = data.pointer("/hits/total/value").and_then(Value::as_i64).unwrap_or(0);
-    if hits.is_empty() {
+    let data = es_response(app, index, "_search", &body).await?;
+    let hits = data.pointer("/hits/hits").and_then(Value::as_array).ok_or_else(|| EsError::invalid("hits.hits"))?;
+    let flakes = group_hits(hits);
+    if flakes.is_empty() {
         return Ok(format!("No flakes found matching '{query}'"));
     }
 
-    let flakes = group_hits(&hits);
-    let mut results = vec![if total > flakes.len() as i64 {
-        format!("Found {} matches ({} unique flakes) for '{query}':\n", commas(total), flakes.len())
+    let total = data.pointer("/hits/total/value").and_then(Value::as_i64).unwrap_or(hits.len() as i64);
+    let shown = flakes.len().min(limit as usize);
+    let noun = if shown == 1 { "flake" } else { "flakes" };
+    let mut results = vec![if total > hits.len() as i64 || shown < flakes.len() {
+        format!("Showing {shown} {noun} for '{query}' ({} matching package records):\n", commas(total))
     } else {
-        format!("Found {} flakes matching '{query}':\n", flakes.len())
+        format!("Found {shown} {noun} matching '{query}':\n")
     }];
-    for flake in flakes.values() {
+    for flake in flakes.values().take(shown) {
         results.push(format!("* {}", flake.name));
         if !flake.owner.is_empty() && !flake.repo.is_empty() {
             results.push(format!("  Repository: {}/{}", flake.owner, flake.repo));
@@ -125,12 +126,8 @@ async fn run_search(app: &App, query: &str, limit: i64) -> Result<String, String
         }
         if !flake.packages.is_empty() {
             let packages: Vec<&str> = flake.packages.iter().take(5).map(String::as_str).collect();
-            let packages = packages.join(", ");
-            results.push(if flake.packages.len() > 5 {
-                format!("  Packages: {packages}, ... ({} total)", flake.packages.len())
-            } else {
-                format!("  Packages: {packages}")
-            });
+            let suffix = if flake.packages.len() > packages.len() { ", ..." } else { "" };
+            results.push(format!("  Packages: {}{suffix}", packages.join(", ")));
         }
         results.push(String::new());
     }
@@ -139,21 +136,30 @@ async fn run_search(app: &App, query: &str, limit: i64) -> Result<String, String
 
 /// Search NixOS flakes by name or description.
 pub async fn search_flakes(app: &App, query: &str, limit: i64) -> String {
-    run_search(app, query, limit).await.unwrap_or_else(err)
+    with_flake_index(app, |index| async move { run_search(app, &index, query, limit).await }).await
 }
 
 /// Get flake ecosystem statistics.
 pub async fn stats_flakes(app: &App) -> String {
+    with_flake_index(app, |index| async move {
+        let total = es_count(app, &index, "package").await?;
+        Ok(format!("NixOS Flakes Statistics:\n* Available packages: {}", commas(total)))
+    })
+    .await
+}
+
+async fn with_flake_index<F>(app: &App, mut run: impl FnMut(String) -> F) -> String
+where
+    F: Future<Output = Result<String, EsError>> + Send,
+{
     let flake_index = app.caches.channels.flake_index(&app.http).await;
-    let body = json!({"query": {"term": {"type": "package"}}});
-    let request = app.http.post_es(&format!("{NIXOS_API}/{flake_index}/_count"), &body);
-    match app.http.send(request, 10).await.and_then(|resp| resp.json()) {
-        Ok(data) => {
-            let total = data.get("count").and_then(Value::as_i64).unwrap_or(0);
-            format!("NixOS Flakes Statistics:\n* Available packages: {}", commas(total))
-        }
-        Err(_) => err("Flake indices not found"),
+    let result = run(flake_index.clone()).await;
+    if result.as_ref().is_err_and(EsError::is_not_found) {
+        app.caches.channels.refresh_after_404(&flake_index).await;
+        let updated = app.caches.channels.flake_index(&app.http).await;
+        return run(updated).await.unwrap_or_else(err);
     }
+    result.unwrap_or_else(err)
 }
 
 #[cfg(test)]

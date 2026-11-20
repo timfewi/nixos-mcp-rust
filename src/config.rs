@@ -48,5 +48,21 @@ pub const MAX_LINE_LIMIT: i64 = 2000;
 pub const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Known sources, to distinguish them from flake paths.
-pub const KNOWN_SOURCES: [&str; 11] =
-    ["nixos", "home-manager", "darwin", "flakes", "flakehub", "nixvim", "nvf", "wiki", "nix-dev", "noogle", "nixhub"];
+pub const KNOWN_SOURCES: [&str; 16] = [
+    "nixos",
+    "home-manager",
+    "darwin",
+    "flakes",
+    "flakehub",
+    "nixvim",
+    "nvf",
+    "wiki",
+    "nix-dev",
+    "noogle",
+    "nixhub",
+    "microvm",
+    "flake-parts",
+    "pinned",
+    "nur",
+    "nix-locate",
+];

@@ -22,9 +22,15 @@ use crate::App;
 use crate::caches::HtmlSource::{Darwin, HomeManager};
 use crate::config::{DEFAULT_LINE_LIMIT, KNOWN_SOURCES, MAX_LINE_LIMIT, VERSION};
 use crate::sources::base::{browse_options, info_html_options, list_channels, search_html_options, stats_html_options};
-use crate::sources::flake_inputs::{flake_inputs_list, flake_inputs_ls, flake_inputs_read};
+use crate::sources::flake_inputs::{
+    flake_inputs_list, flake_inputs_lock, flake_inputs_ls, flake_inputs_read, pinned_info,
+};
 use crate::sources::flakehub::{info_flakehub, search_flakehub, stats_flakehub};
 use crate::sources::flakes::{search_flakes, stats_flakes};
+use crate::sources::module_options::{
+    self,
+    ModuleSource::{FlakeParts, Microvm},
+};
 use crate::sources::nixdev::{info_nixdev, search_nixdev};
 use crate::sources::nixhub::{
     check_binary_cache, fetch_pkg, first_programs, format_release, info_nixhub, program_summary, search_nixhub,
@@ -35,6 +41,7 @@ use crate::sources::noogle::{browse_noogle, info_noogle, search_noogle, stats_no
 use crate::sources::nvf::{browse_nvf, info_nvf, search_nvf, stats_nvf};
 use crate::sources::store::{store_ls, store_read};
 use crate::sources::wiki::{info_wiki, search_wiki};
+use crate::sources::{locate, nur};
 use crate::text::{err, error, str_of};
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
@@ -53,8 +60,11 @@ fn default_source() -> String {
 fn default_type() -> String {
     "packages".to_owned()
 }
-fn default_channel() -> String {
-    "unstable".to_owned()
+fn default_directory() -> String {
+    ".".to_owned()
+}
+fn default_input() -> String {
+    "nixpkgs".to_owned()
 }
 fn default_version() -> String {
     "latest".to_owned()
@@ -89,8 +99,12 @@ pub struct NixParams {
     pub source: String,
     #[serde(default = "default_type", rename = "type")]
     pub kind: String,
-    #[serde(default = "default_channel")]
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default = "default_directory")]
+    pub flake_dir: String,
+    #[serde(default = "default_input")]
+    pub input: String,
     #[serde(default = "default_limit", deserialize_with = "lenient_int")]
     pub limit: i64,
     #[serde(default = "default_version")]
@@ -117,6 +131,7 @@ async fn blocking(work: impl FnOnce() -> String + Send + 'static) -> String {
 async fn search(app: &App, params: &NixParams) -> String {
     let NixParams { query, source, kind, channel, limit, .. } = params;
     let limit = *limit;
+    let channel = channel.as_deref().unwrap_or("unstable");
     if query.is_empty() {
         return err(r#"Query required for search. Example: {"action": "search", "query": "firefox"}"#);
     }
@@ -128,6 +143,10 @@ async fn search(app: &App, params: &NixParams) -> String {
             }
             search_nixos(app, query, kind, limit, channel).await
         }
+        "microvm" => module_options::search(app, Microvm, query, limit).await,
+        "flake-parts" => module_options::search(app, FlakeParts, query, limit).await,
+        "nur" => nur::search(app, query, limit as usize).await,
+        "nix-locate" => locate::search(query, limit as usize).await,
         "home-manager" => search_html_options(app, HomeManager, query, limit).await,
         "darwin" => search_html_options(app, Darwin, query, limit).await,
         "flakes" => search_flakes(app, query, limit).await,
@@ -140,13 +159,14 @@ async fn search(app: &App, params: &NixParams) -> String {
         "nixhub" => search_nixhub(app, query, limit).await,
         other => err(format!(
             "Unknown source: '{other}'. Must be one of: \
-             nixos, home-manager, darwin, flakes, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub."
+             nixos, home-manager, darwin, flakes, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub, microvm, flake-parts, nur, nix-locate."
         )),
     }
 }
 
 async fn info(app: &App, params: &NixParams) -> String {
     let NixParams { query, source, kind, channel, .. } = params;
+    let channel = channel.as_deref().unwrap_or("unstable");
     if query.is_empty() {
         return err(r#"Name required for info. Example: {"action": "info", "query": "firefox"}"#);
     }
@@ -166,6 +186,11 @@ async fn info(app: &App, params: &NixParams) -> String {
             _ => err("For source=nixos, type must be 'package' or 'option'. \
                  Example: {\"action\": \"info\", \"query\": \"services.nginx.enable\", \"type\": \"option\"}"),
         },
+        "microvm" => module_options::info(app, Microvm, query).await,
+        "flake-parts" => module_options::info(app, FlakeParts, query).await,
+        "nur" => nur::info(app, query).await,
+        "pinned" if params.channel.is_some() => err("Pinned package info uses flake.lock. Omit channel."),
+        "pinned" => pinned_info(&params.flake_dir, &params.input, query, &params.system).await,
         "home-manager" => info_html_options(app, HomeManager, query).await,
         "darwin" => info_html_options(app, Darwin, query).await,
         "flakehub" => info_flakehub(app, query).await,
@@ -177,14 +202,16 @@ async fn info(app: &App, params: &NixParams) -> String {
         "nixhub" => info_nixhub(app, query).await,
         other => err(format!(
             "Unknown source: '{other}'. For action=info, must be one of: \
-             nixos, home-manager, darwin, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub."
+             nixos, home-manager, darwin, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub, microvm, flake-parts, nur, pinned."
         )),
     }
 }
 
 async fn stats(app: &App, params: &NixParams) -> String {
     match params.source.as_str() {
-        "nixos" => stats_nixos(app, &params.channel).await,
+        "nixos" => stats_nixos(app, params.channel.as_deref().unwrap_or("unstable")).await,
+        "microvm" => module_options::stats(app, Microvm).await,
+        "flake-parts" => module_options::stats(app, FlakeParts).await,
         "home-manager" => stats_html_options(app, HomeManager).await,
         "darwin" => stats_html_options(app, Darwin).await,
         "flakes" => stats_flakes(app).await,
@@ -195,7 +222,7 @@ async fn stats(app: &App, params: &NixParams) -> String {
         source @ ("wiki" | "nix-dev" | "nixhub") => err(format!("Stats not available for source={source}.")),
         other => err(format!(
             "Unknown source: '{other}'. For action=stats, must be one of: \
-             nixos, home-manager, darwin, flakes, flakehub, nixvim, nvf, noogle."
+             nixos, home-manager, darwin, flakes, flakehub, nixvim, nvf, noogle, microvm, flake-parts."
         )),
     }
 }
@@ -207,13 +234,17 @@ async fn browse(app: &App, params: &NixParams) -> String {
              {\"action\": \"search\", \"query\": \"nginx\", \"type\": \"options\"}. \
              To get a specific option's details, use: \
              {\"action\": \"info\", \"query\": \"services.nginx.enable\", \"type\": \"option\"}."),
+        "microvm" => module_options::browse(app, Microvm, query, params.limit).await,
+        "flake-parts" => module_options::browse(app, FlakeParts, query, params.limit).await,
         "home-manager" => browse_options(app, HomeManager, query).await,
         "darwin" => browse_options(app, Darwin, query).await,
         "nixvim" => browse_nixvim(app, query).await,
         "nvf" => browse_nvf(app, query).await,
         "noogle" => browse_noogle(app, query).await,
-        _ => err("action=browse only supports source in: home-manager, darwin, nixvim, nvf, noogle. \
-             Example: {\"action\": \"browse\", \"query\": \"programs\", \"source\": \"home-manager\"}"),
+        _ => err(
+            "action=browse only supports source in: home-manager, darwin, nixvim, nvf, noogle, microvm, flake-parts. \
+             Example: {\"action\": \"browse\", \"query\": \"programs\", \"source\": \"home-manager\"}",
+        ),
     }
 }
 
@@ -225,15 +256,16 @@ fn line_limit(limit: i64) -> usize {
 
 async fn flake_inputs(params: &NixParams) -> String {
     let NixParams { query, source, kind, limit, .. } = params;
-    let flake_dir = if KNOWN_SOURCES.contains(&source.as_str()) { "." } else { source.as_str() };
+    let flake_dir = if KNOWN_SOURCES.contains(&source.as_str()) { &params.flake_dir } else { source.as_str() };
     // "packages" is accepted as an alias for "list" (the default type).
     match kind.as_str() {
+        "lock" => flake_inputs_lock(flake_dir, query, *limit as usize).await,
         "list" | "packages" => flake_inputs_list(flake_dir).await,
         "ls" if query.is_empty() => err("Query required for ls (input name or input:path)"),
         "ls" => flake_inputs_ls(flake_dir, query).await,
         "read" if query.is_empty() => err("Query required for read (input:path format)"),
         "read" => flake_inputs_read(flake_dir, query, line_limit(*limit)).await,
-        _ => err("Type must be one of: list, ls, read for flake-inputs"),
+        _ => err("Type must be one of: list, ls, read, lock for flake-inputs"),
     }
 }
 
@@ -275,6 +307,10 @@ pub async fn nix(app: &App, params: NixParams) -> String {
         "channels" => list_channels(app).await,
         "flake-inputs" => flake_inputs(&params).await,
         "cache" if params.query.is_empty() => err("Package name required for cache action"),
+        "cache" if params.channel.is_some() => err(
+            "The cache action resolves versions with NixHub. It does not support a channel. Omit channel and optionally specify version and system.",
+        ),
+        "cache" if !matches!(params.source.as_str(), "nixos" | "nixhub") => err("The cache action uses source=nixhub."),
         "cache" => check_binary_cache(app, &params.query, &params.version, &params.system).await,
         "store" => store(&params).await,
         other => err(format!(
@@ -426,7 +462,9 @@ impl ServerHandler for Server {
                 return Err(ErrorData::internal_error("Request cancelled", None));
             }
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+        let is_error = text.starts_with("Error (");
+        let content = vec![ContentBlock::text(text)];
+        Ok(if is_error { CallToolResult::error(content) } else { CallToolResult::success(content) }.into())
     }
 }
 
@@ -447,7 +485,7 @@ mod tests {
         let default = |key: &str| schema["properties"][key]["default"].clone();
         assert_eq!(default("source"), json!(parsed.map(|p| p.source.as_str())));
         assert_eq!(default("type"), json!(parsed.map(|p| p.kind.as_str())));
-        assert_eq!(default("channel"), json!(parsed.map(|p| p.channel.as_str())));
+        assert_eq!(default("channel"), json!(parsed.and_then(|p| p.channel.as_deref())));
         assert_eq!(default("limit"), json!(parsed.map(|p| p.limit)));
         assert_eq!(default("version"), json!(parsed.map(|p| p.version.as_str())));
     }

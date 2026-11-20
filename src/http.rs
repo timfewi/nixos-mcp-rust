@@ -155,7 +155,8 @@ async fn read_body(builder: RequestBuilder, timeout_secs: u64, cap: usize) -> Re
     let url = response.url().to_string();
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        body.extend_from_slice(&chunk);
+        let remaining = cap.saturating_add(1) - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         if body.len() > cap {
             break;
         }

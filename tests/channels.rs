@@ -97,6 +97,13 @@ async fn flake_index_comes_from_the_alias_probe() {
 #[tokio::test]
 async fn channel_listing_labels_indexed_commits_and_branch_heads() {
     let fixture = serve(move |request| {
+        if request.path.contains("_cat/aliases") {
+            return json_reply(json!([
+                {"alias": "latest-50-nixos-unstable", "index": format!("nixos-50-unstable-{}", "a".repeat(40))},
+                {"alias": "latest-50-nixos-26.05", "index": "nixos-50-26.05-latest"},
+                {"alias": "latest-48-nixos-25.11", "index": format!("nixos-48-25.11-{}", "b".repeat(40))},
+            ]));
+        }
         if request.path.contains("api.github.com") {
             return json_reply(json!({"sha": "c".repeat(40)}));
         }
@@ -108,11 +115,78 @@ async fn channel_listing_labels_indexed_commits_and_branch_heads() {
     assert!(text.contains("* stable (current: 26.05) -> latest-50-nixos-26.05"), "{text}");
     assert!(text.contains("Status: Available (1,234 documents)"), "{text}");
     assert!(text.contains("Branch: nixos-unstable"), "{text}");
+    assert!(text.contains(&format!("Revision (indexed): {}", "a".repeat(40))));
+    assert!(text.contains(&format!("Revision (indexed): {}", "b".repeat(40))));
     assert!(text.contains(&format!("Branch HEAD: {} (upstream; may be ahead of indexed data)", "c".repeat(40))));
 
     call(&app, json!({"action": "channels"})).await;
-    let lookups = fixture.count("commits/nixos-unstable");
-    assert_eq!(lookups, 1, "the TTL cache must answer repeat listings");
+    assert_eq!(fixture.count("commits/nixos-unstable"), 0, "the alias target contains the indexed revision");
+    assert_eq!(fixture.count("commits/nixos-26.05"), 1, "the TTL cache must answer repeat listings");
+}
+
+#[tokio::test]
+async fn retired_nixos_alias_is_rediscovered_and_retried() {
+    for args in [
+        json!({"action": "search", "query": "hello"}),
+        json!({"action": "info", "query": "hello"}),
+        json!({"action": "info", "query": "services.hello.enable", "type": "option"}),
+        json!({"action": "stats"}),
+    ] {
+        let retired = Arc::new(AtomicBool::new(false));
+        let flag = retired.clone();
+        let fixture = serve(move |request| {
+            if request.path.contains("_cat/aliases") {
+                return aliases(&[if flag.load(Ordering::SeqCst) {
+                    "latest-51-nixos-unstable"
+                } else {
+                    "latest-50-nixos-unstable"
+                }]);
+            }
+            if request.path.contains("latest-50") && flag.load(Ordering::SeqCst) {
+                return status(404);
+            }
+            if request.path.ends_with("/_count") {
+                return json_reply(json!({"count": 5}));
+            }
+            es_hits(vec![json!({
+                "package_pname": "hello",
+                "package_pversion": "2.0",
+                "option_name": "services.hello.enable",
+            })])
+        });
+        let app = fixture.app();
+        let expected = call(&app, args.clone()).await;
+        assert!(!expected.starts_with("Error"), "{expected}");
+        retired.store(true, Ordering::SeqCst);
+        assert_eq!(call(&app, args).await, expected);
+        assert_eq!(fixture.count("_cat/aliases"), 2);
+    }
+}
+
+#[tokio::test]
+async fn retired_flake_alias_is_rediscovered_and_retried() {
+    let retired = Arc::new(AtomicBool::new(false));
+    let flag = retired.clone();
+    let fixture = serve(move |request| {
+        if request.path.contains("_cat/aliases") {
+            return aliases(&[if flag.load(Ordering::SeqCst) {
+                "latest-52-group-manual"
+            } else {
+                "latest-51-group-manual"
+            }]);
+        }
+        if request.path.contains("latest-51") && flag.load(Ordering::SeqCst) {
+            return status(404);
+        }
+        json_reply(json!({"count": 42}))
+    });
+    let app = fixture.app();
+    let args = json!({"action": "stats", "source": "flakes"});
+    let expected = "NixOS Flakes Statistics:\n* Available packages: 42";
+    assert_eq!(call(&app, args.clone()).await, expected);
+    retired.store(true, Ordering::SeqCst);
+    assert_eq!(call(&app, args).await, expected);
+    assert_eq!(fixture.count("_cat/aliases"), 2);
 }
 
 #[tokio::test]

@@ -10,6 +10,8 @@ const projectRoot = resolve(extensionDir, "../..");
 
 const PROTOCOL_VERSION = "2026-07-28";
 
+class ToolExecutionError extends Error {}
+
 class CancelledError extends Error {
 	constructor() {
 		super("Cancelled");
@@ -57,6 +59,7 @@ async function callServer(
 				const reply = JSON.parse(stdout.slice(0, newline));
 				if (reply.error) throw new Error(reply.error.message);
 				const text = reply.result.content.map((block: { text?: string }) => block.text ?? "").join("");
+				if (reply.result.isError) throw new ToolExecutionError(text);
 				settle(() => resolvePromise(text));
 			} catch (error) {
 				settle(() => reject(error));
@@ -108,6 +111,7 @@ async function runNixosTool(tool: "nix" | "nix_versions", args: unknown, signal?
 			return (await callServer(candidate.command, candidate.args, tool, args, signal)).trimEnd();
 		} catch (error) {
 			// Cancellation stops retries — don't spawn more servers after abort.
+			if (error instanceof ToolExecutionError) throw error;
 			if (error instanceof CancelledError || signal?.aborted) {
 				throw error instanceof CancelledError ? error : new CancelledError();
 			}
@@ -130,7 +134,7 @@ const nixToolParams = Type.Object({
 		description:
 			"One of: search, info, stats, browse, channels, flake-inputs, cache, store. " +
 			"search = keyword lookup; info = details for a specific name; " +
-			"browse = walk an option hierarchy by prefix (home-manager/darwin/nixvim/nvf/noogle only); " +
+			"browse = walk an option hierarchy by prefix (home-manager/darwin/nixvim/nvf/noogle/microvm/flake-parts); " +
 			"store = read files or list directories at an explicit /nix/store/ path.",
 	}),
 	query: Type.Optional(
@@ -145,7 +149,7 @@ const nixToolParams = Type.Object({
 		Type.String({
 			description:
 				"Data source for search/info/stats/browse/cache. One of: nixos (default), " +
-				"home-manager, darwin, flakes, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub. " +
+				"home-manager, darwin, flakes, flakehub, nixvim, nvf, wiki, nix-dev, noogle, nixhub, microvm, flake-parts, nur, nix-locate, pinned. " +
 				"For action=flake-inputs, this may instead be a path to a flake directory; " +
 				"omit/default to use the current project. Ignored by action=store.",
 		}),
@@ -155,12 +159,12 @@ const nixToolParams = Type.Object({
 			description:
 				"Sub-type of query. For source=nixos with action=search, one of: " +
 				"packages, options, programs, flakes. For source=nixos with action=info, one of: " +
-				"package, option. For flake-inputs, one of: list, ls, read. For store, one of: " +
+				"package, option. For flake-inputs, one of: list, ls, read, lock. For store, one of: " +
 				"ls, read. Ignored by most other sources.",
 		}),
 	),
 	channel: Type.Optional(
-		Type.String({ description: "NixOS channel: unstable (default), stable, or a release like 25.05." }),
+		Type.String({ description: "NixOS index channel: unstable (default), stable, or a release. Omit for cache and pinned lookups." }),
 	),
 	limit: Type.Optional(
 		Type.Integer({ description: "Max results. 1-100 (or 1-2000 for flake-inputs/store read). Default 20." }),
@@ -168,9 +172,11 @@ const nixToolParams = Type.Object({
 	version: Type.Optional(
 		Type.String({ description: "Only used by action=cache. Package version (default: latest)." }),
 	),
+	flake_dir: Type.Optional(Type.String({ description: "Project directory for pinned or flake-inputs lookups." })),
+	input: Type.Optional(Type.String({ description: "Locked nixpkgs-compatible input for source=pinned (default nixpkgs)." })),
 	system: Type.Optional(
 		Type.String({
-			description: "Only used by action=cache. System arch e.g. x86_64-linux. Empty for all.",
+			description: "System such as x86_64-linux. Required for source=pinned, optional filter for cache.",
 		}),
 	),
 });
@@ -183,6 +189,8 @@ const nixToolDescription = [
 	"Examples (copy the JSON shape exactly):",
 	'  Search NixOS packages:    {"action": "search", "query": "firefox"}',
 	'  Search NixOS options:     {"action": "search", "query": "nginx", "type": "options"}',
+	'  Pinned package:           {"action":"info","source":"pinned","query":"ripgrep","system":"x86_64-linux"}',
+	'  Search file providers:    {"action":"search","source":"nix-locate","query":"include/zlib.h"}',
 	'  Get a package:            {"action": "info", "query": "firefox"}',
 	'  Get an option:            {"action": "info", "query": "services.nginx.enable", "type": "option"}',
 	'  Search Home Manager:      {"action": "search", "query": "git", "source": "home-manager"}',
@@ -200,7 +208,7 @@ const nixToolDescription = [
 	"",
 	"Notes:",
 	"  - To search NixOS options, use action=search with type=options. Do NOT use action=browse for source=nixos.",
-	"  - action=browse walks a pre-indexed option tree and only supports home-manager, darwin, nixvim, nvf, or noogle.",
+	"  - action=browse walks a pre-indexed option tree and only supports home-manager, darwin, nixvim, nvf, microvm, flake-parts, or noogle.",
 	"  - NVF's canonical paths are vim.*; programs.nvf.vim.* is shorthand and programs.nvf.settings.vim.* is the module-path alias.",
 	"  - For source=nix-dev, action=info returns the page markdown. Query accepts a bare docname ('tutorials/nix-language'), the URL printed by nix-dev search ('https://nix.dev/tutorials/nix-language'), or a rendered '.html' URL.",
 	"  - Omit optional parameters; don't pass empty strings.",
@@ -217,7 +225,7 @@ const nixTool = defineTool({
 		"Prefer the nix tool over web search for NixOS-related package, option, flake, wiki, nix.dev, and cache questions.",
 		'To search NixOS options: {"action": "search", "query": "<keyword>", "type": "options"}.',
 		'To inspect a NixOS option: {"action": "info", "query": "<option.path>", "type": "option"}.',
-		"action=browse is for walking option prefixes in home-manager, darwin, nixvim, nvf, or noogle only — never with source=nixos.",
+		"action=browse is for walking option prefixes in home-manager, darwin, nixvim, nvf, microvm, flake-parts, or noogle only — never with source=nixos.",
 	],
 	parameters: nixToolParams,
 	async execute(_toolCallId: string, params: NixToolParams, signal: AbortSignal | undefined) {
@@ -238,6 +246,8 @@ const nixTool = defineTool({
 		if (params.limit !== undefined) normalized.limit = params.limit;
 		if (params.version !== undefined) normalized.version = params.version;
 		if (params.system !== undefined) normalized.system = params.system;
+		if (params.flake_dir !== undefined) normalized.flake_dir = params.flake_dir;
+		if (params.input !== undefined) normalized.input = params.input;
 
 		const text = await runNixosTool("nix", normalized, signal);
 		return {

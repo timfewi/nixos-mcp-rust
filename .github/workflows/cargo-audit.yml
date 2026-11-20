@@ -1,0 +1,40 @@
+name: Cargo audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - .github/workflows/cargo-audit.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - .github/workflows/cargo-audit.yml
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Audit Cargo.lock
+        run: nix develop --no-write-lock-file --command cargo audit --file Cargo.lock

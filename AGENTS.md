@@ -102,7 +102,7 @@ cargo test noogle                         # Tests matching a pattern
 ```nix
 # In your flake.nix
 {
-  inputs.mcp-nixos.url = "github:timfewi/mcp-nixos-rust";
+  inputs.mcp-nixos.url = "github:timfewi/nixos-mcp-rust";
 
   outputs = { nixpkgs, mcp-nixos, ... }: {
     # Use the overlay to add pkgs.mcp-nixos
@@ -123,7 +123,7 @@ cargo test noogle                         # Tests matching a pattern
     "nixos": {
       "type": "stdio",
       "command": "nix",
-      "args": ["run", "github:timfewi/mcp-nixos-rust"]
+      "args": ["run", "github:timfewi/nixos-mcp-rust"]
     }
   }
 }
@@ -148,4 +148,4 @@ cargo test noogle                         # Tests matching a pattern
 
 - Commit messages follow `type: summary` (e.g., `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`).
 - **CI**: Runs on all PRs - flake check, Nix build, clippy, rustfmt, tests.
-- **Releases**: This fork publishes no registry artifacts (no Docker images, FlakeHub or website deployment). Consumers pin the flake from `github:timfewi/mcp-nixos-rust`. Bump `Cargo.toml`/`Cargo.lock` and `RELEASE_NOTES.md` together when changing the version.
+- **Releases**: This fork publishes no registry artifacts (no Docker images, FlakeHub or website deployment). Consumers pin the flake from `github:timfewi/nixos-mcp-rust`. Bump `Cargo.toml`/`Cargo.lock` and `RELEASE_NOTES.md` together when changing the version.

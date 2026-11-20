@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 description = "Model Context Protocol server for NixOS, Home Manager, and nix-darwin resources"
 license = "MIT"
-repository = "https://github.com/timfewi/mcp-nixos-rust"
+repository = "https://github.com/timfewi/nixos-mcp-rust"
 readme = "README.md"
 
 [lib]
@@ -24,12 +24,12 @@ indexmap = "2"
 percent-encoding = "2"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "json", "query"] }
-rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 scraper = { version = "0.27", default-features = false }
 ego-tree = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "process", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time"] }
 webpki-root-certs = "1"
 
 [lints.rust]

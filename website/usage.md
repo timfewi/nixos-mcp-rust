@@ -31,7 +31,7 @@ And you know what? You might be right.
   "mcpServers": {
     "nixos": {
       "command": "nix",
-      "args": ["run", "github:timfewi/mcp-nixos-rust", "--"]
+      "args": ["run", "github:timfewi/nixos-mcp-rust", "--"]
     }
   }
 }
@@ -62,7 +62,7 @@ Or consume the flake directly via the provided overlay:
 ```nix
 # flake.nix
 {
-  inputs.mcp-nixos.url = "github:timfewi/mcp-nixos-rust";
+  inputs.mcp-nixos.url = "github:timfewi/nixos-mcp-rust";
 
   outputs = { nixpkgs, mcp-nixos, ... }: {
     nixpkgs.overlays = [ mcp-nixos.overlays.default ];
@@ -80,7 +80,7 @@ Or consume the flake directly via the provided overlay:
 <UsageOption title="For Rust people" alt note="One binary, no runtime, no virtualenv archaeology.">
 
 ```bash
-cargo install --git https://github.com/timfewi/mcp-nixos-rust
+cargo install --git https://github.com/timfewi/nixos-mcp-rust
 ```
 
 ```json
@@ -137,17 +137,17 @@ Just two. We consolidated 17 tools into 2 because your AI's context window isn't
 One tool to rule them all:
 
 ```text
-nix(action, query, source, type, channel, limit, version, system)
+nix(action, query, source, type, channel, limit, version, system, flake_dir, input)
 ```
 
-`version` and `system` are only used by `action="cache"`.
+Supply `system` for a pinned package lookup. Cache checks accept a NixHub version and optional system. Omit `channel` for cache checks.
 
 | Action | What it does |
 |--------|-------------|
 | `search` | Search packages, options, programs, flakes, wiki, docs |
 | `info` | Get detailed info about a package, option, or function |
 | `stats` | Counts, channels, categories |
-| `browse` | Browse Home Manager, Darwin, Nixvim, NVF, or Noogle by prefix (alias: `options`) |
+| `browse` | Browse Home Manager, Darwin, Nixvim, NVF, MicroVM.nix, flake-parts, or Noogle by prefix (alias: `options`) |
 | `channels` | List available NixOS channels |
 | `flake-inputs` | Explore local flake inputs from the Nix store |
 | `cache` | Check binary cache status for packages |
@@ -166,6 +166,11 @@ nix(action, query, source, type, channel, limit, version, system)
 | `wiki` | NixOS Wiki articles (wiki.nixos.org) |
 | `nix-dev` | Official Nix docs (nix.dev) |
 | `nixhub` | Package metadata & store paths (nixhub.io) |
+| `pinned` | Exact package from a local project’s locked nixpkgs input |
+| `nur` | NUR community package catalogue |
+| `nix-locate` | Packages providing a file in a local nix-index database |
+| `microvm` | MicroVM.nix host and guest options |
+| `flake-parts` | Core flake-parts options |
 
 NVF returns canonical `vim.*` option paths. It also accepts the shorthand
 `programs.nvf.vim.*` and the actual NixOS/Home Manager module path
