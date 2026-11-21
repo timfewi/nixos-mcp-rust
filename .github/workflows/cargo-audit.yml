@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - Cargo.toml
       - Cargo.lock
       - flake.nix
       - flake.lock
@@ -11,12 +12,13 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - Cargo.toml
       - Cargo.lock
       - flake.nix
       - flake.lock
       - .github/workflows/cargo-audit.yml
   schedule:
-    - cron: '17 4 * * 1'
+    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:

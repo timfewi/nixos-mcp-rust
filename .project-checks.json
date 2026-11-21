@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "format",
+      "argv": ["just", "fmt-check"],
+      "requires": [
+        "just",
+        "python3",
+        "rg",
+        "nixfmt",
+        "shfmt",
+        "biome",
+        "cargo"
+      ],
+      "timeout_seconds": 120,
+      "profiles": ["fast"]
+    },
+    {
+      "name": "statix",
+      "argv": ["statix", "check", "."],
+      "requires": ["statix"],
+      "timeout_seconds": 120,
+      "profiles": ["fast"]
+    },
+    {
+      "name": "deadnix",
+      "argv": ["deadnix", "--fail", "."],
+      "requires": ["deadnix"],
+      "timeout_seconds": 120,
+      "profiles": ["fast"]
+    },
+    {
+      "name": "flake-eval",
+      "argv": [
+        "nix",
+        "flake",
+        "check",
+        "--no-build",
+        "--all-systems",
+        "--no-write-lock-file",
+        "--option",
+        "warn-dirty",
+        "false",
+        "."
+      ],
+      "requires": ["nix"],
+      "timeout_seconds": 900,
+      "profiles": ["full"]
+    },
+    {
+      "name": "package",
+      "argv": [
+        "nix",
+        "build",
+        "--no-link",
+        "--no-write-lock-file",
+        "--option",
+        "warn-dirty",
+        "false",
+        ".#mcp-nixos"
+      ],
+      "requires": ["nix"],
+      "timeout_seconds": 900,
+      "profiles": ["full"]
+    },
+    {
+      "name": "cargo-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "requires": ["cargo", "cargo-clippy"],
+      "timeout_seconds": 900,
+      "profiles": ["fast", "full"]
+    },
+    {
+      "name": "cargo-test",
+      "argv": ["cargo", "test", "--locked", "--all-targets"],
+      "requires": ["cargo"],
+      "timeout_seconds": 900,
+      "profiles": ["full"]
+    }
+  ],
+  "watch_ignore": [".devenv", ".direnv", "result", "result-*", "target"]
+}

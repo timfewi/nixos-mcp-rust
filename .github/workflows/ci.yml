@@ -2,135 +2,37 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'website/**'
-      - '.github/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.cursorrules'
-      - 'RELEASE_NOTES.md'
-      - 'RELEASE_WORKFLOW.md'
+    branches: [main]
   pull_request:
-    branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'website/**'
-      - '.github/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.cursorrules'
-      - 'RELEASE_NOTES.md'
-      - 'RELEASE_WORKFLOW.md'
 
 permissions:
   contents: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
-          accept-flake-config = true
-
-    - name: Check flake
-      run: |
-        nix flake check
-        nix flake show --all-systems --json >/dev/null
-
-  build:
-    runs-on: ubuntu-latest
-    needs: check
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
-          accept-flake-config = true
-
-    - name: Build Nix package
-      run: nix build
-
-    - name: Test package runs
-      run: |
-        ./result/bin/mcp-nixos --version
-
-
-  lint:
-    runs-on: ubuntu-latest
-    needs: check
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
-          accept-flake-config = true
-
-    - name: Lint with clippy
-      run: nix develop --command cargo clippy --all-targets -- -D warnings
-
-    - name: Check formatting
-      run: nix develop --command cargo fmt --check
-
-  test:
-    runs-on: ubuntu-latest
-    needs: check
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
-          accept-flake-config = true
-
-    - name: Run tests
-      timeout-minutes: 10
-      run: nix develop --command cargo test
-
-  # Verify the release image still builds on both supported Linux architectures.
-  docker-build:
-    runs-on: ${{ matrix.runner }}
-    needs: [build, lint, test]
     strategy:
       matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-            system: x86_64-linux
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-            system: aarch64-linux
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
-          accept-flake-config = true
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
 
-    - name: Build Docker image with Nix
-      run: nix build .#packages.${{ matrix.system }}.docker
+      - name: Run the scaffold checks
+        if: matrix.runner == 'ubuntu-latest'
+        run: nix shell --inputs-from . nixpkgs#devenv --command devenv --no-tui shell -- just check
+
+      - name: Evaluate all supported platforms
+        if: matrix.runner == 'ubuntu-latest'
+        run: nix flake check --no-write-lock-file --no-build --all-systems
+
+      - name: Build and test the package
+        run: nix flake check --no-write-lock-file --print-build-logs
+
+      - name: Run the packaged binary
+        run: nix run --no-write-lock-file . -- --version

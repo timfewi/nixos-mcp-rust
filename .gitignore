@@ -1,57 +1,21 @@
-# Rust
 /target/
-
-# Environments
+/result
+/result-*
+/.devenv/
+/devenv.local.nix
+/devenv.local.yaml
+/.direnv/
 .env
 .env.local
-
-# Nix
-.direnv/
-result
-
-# IDE
 .idea/
+.vscode/
+.zed/
 *.swp
 *.swo
 *~
-.vscode/
-.zed/
-
-# MCP local configuration
-.mcp-nix.json
-
-# Misc
-temp
-tmp
-
-.aider*
-mcp-completion-docs.md
-TODO.md
-
-# Logs
 *.log
-*.DS_Store
-
-# Pi coding agent extensions (editor-only deps; Pi resolves at runtime)
-/.pi/node_modules/
-/.pi/package-lock.json
-
-# Website (VitePress)
-/website/node_modules/
-/website/out/
-/website/.vitepress/cache/
-/website/.vitepress/dist/
-/website/.vercel/
-/website/.env*.local
-/website/npm-debug.log*
-/website/yarn-debug.log*
-/website/yarn-error.log*
-/website/pnpm-debug.log*
-/website/.pnpm-store/
-/website/.DS_Store
-/website/*.pem
-
-# Claude Code runtime state
-.claude/scheduled_tasks.lock
-
-reference-mcp-coroot/
+.DS_Store
+/secrets.enc.yaml
+/.tabula/state.json
+/.tabula/index.html
+__pycache__/
